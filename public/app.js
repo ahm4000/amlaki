@@ -457,7 +457,9 @@
     const p = d.property, s = d.summary, refresh = () => render();
     const p2 = { ...p, summary: s };
     const section = (kind, title) => h('section', { class: 'card', id: kind },
-      h('div', { class: 'card-head' }, h('h2', {}, title), h('button', { class: 'btn btn-outline', type: 'button', 'data-add': kind, onclick: () => recordForm(kind, p.id, null, refresh) }, '+ ' + t('add'))),
+      h('div', { class: 'card-head' }, h('h2', {}, title), h('div', { class: 'head-actions' },
+        kind === 'payments' ? h('button', { class: 'btn btn-primary', type: 'button', id: 'add-cheques', onclick: () => chequesDialog(p, s, d.today, refresh, d.payments.length > 0) }, '+ ' + t('ch.add')) : null,
+        h('button', { class: 'btn btn-outline', type: 'button', 'data-add': kind, onclick: () => recordForm(kind, p.id, null, refresh) }, '+ ' + t(kind === 'payments' ? 'ch.single' : 'add')))),
       recordTable(kind, d[kind], d.today, refresh));
 
     const agentBox = p.can.assign_agent ? h('div', { class: 'agent-box' },
@@ -516,6 +518,52 @@
       h('section', { class: 'card', id: 'documents' }, h('div', { class: 'card-head' }, h('h2', {}, t('p.documents')),
         h('div', { class: 'head-actions' }, docType, fileInput('+ ' + t('p.upload'), 'application/pdf,image/*', true, async (files) => { for (const f of files) await uploadFile(p.id, f, 'document', { doc_type: docType.value }); refresh(); }))),
         docTable(docs, refresh)));
+  }
+  // Quick entry of several cheques: total and number of cheques in, amounts and dates out.
+  function chequesDialog(p, s, today, refresh, hasPayments) {
+    const preview = h('ol', { class: 'cheque-preview', id: 'cheque-preview' });
+    const sumLine = h('p', { class: 'muted', id: 'cheque-sum' });
+    const error = h('p', { class: 'form-error', role: 'alert' });
+    const submit = h('button', { class: 'btn btn-primary', type: 'submit' }, t('ch.create'));
+    const top = h('div', { class: 'form-grid' },
+      field({ name: 'total', type: 'number', required: true, label: t('ch.total') }, p.rent_annual || ''),
+      field({ name: 'count', type: 'select', required: true, label: t('ch.count'), options: [1, 2, 3, 4, 6, 12].map((n) => ({ value: n, label: t('ch.every.' + n) })) }, 4),
+      field({ name: 'first_date', type: 'date', required: true, label: t('ch.first') }, s.contract && !hasPayments ? s.contract.start : today),
+      field({ name: 'months', type: 'number', required: true, step: '1', label: t('ch.months') }, s.contract ? s.contract.months : 12));
+    const form = h('form', { class: 'dlg-body' },
+      h('p', { class: 'muted' }, t('ch.intro')), top,
+      h('strong', {}, t('ch.preview')), h('p', { class: 'muted' }, t('ch.editable')), preview, sumLine, error,
+      h('div', { class: 'dlg-actions' }, h('button', { class: 'btn', type: 'button', onclick: () => dlg.close() }, t('cancel')), submit));
+    const dlg = openDialog(t('ch.add'), form);
+    const rows = () => [...preview.querySelectorAll('li')].map((li) => ({ due_date: li.querySelector('input[type=date]').value, amount: li.querySelector('input[type=number]').value }));
+    const showSum = () => { sumLine.textContent = t('ch.sum', { n: rows().length, total: aed(rows().reduce((a, r) => a + (Number(r.amount) || 0), 0)) }); };
+    let seq = 0;
+    // Changing the boxes at the top recalculates every cheque. Each cheque can then be adjusted by hand.
+    const draw = async () => {
+      const mine = ++seq;
+      try {
+        const v = Object.fromEntries([...top.querySelectorAll('input, select')].map((el) => [el.name, el.value]));
+        const r = await api('POST', '/api/properties/' + p.id + '/cheques', { ...v, preview: true });
+        if (mine !== seq) return;
+        error.textContent = '';
+        preview.replaceChildren(...r.cheques.map((c, i) => {
+          const dateIn = h('input', { type: 'date', value: c.due_date, required: true, 'aria-label': t('f.due_date') + ' ' + (i + 1) });
+          const amtIn = h('input', { type: 'number', value: String(c.amount), required: true, min: '0', step: 'any', 'aria-label': t('f.amount') + ' ' + (i + 1) });
+          amtIn.inputMode = 'decimal';
+          return h('li', {}, h('div', { class: 'cheque-row' }, dateIn, amtIn));
+        }));
+        showSum();
+      } catch (e) { if (mine === seq) { preview.replaceChildren(); sumLine.textContent = ''; error.textContent = e.message; } }
+    };
+    top.addEventListener('input', draw);
+    preview.addEventListener('input', showSum);
+    draw();
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!rows().length) return;
+      submit.disabled = true;
+      try { await api('POST', '/api/properties/' + p.id + '/cheques', { items: rows() }); dlg.close(); toast(t('saved')); refresh(); } catch (err) { error.textContent = err.message; submit.disabled = false; }
+    });
   }
   function docTable(docs, refresh, withProperty) {
     if (!docs.length) return h('p', { class: 'muted' }, t('p.empty'));

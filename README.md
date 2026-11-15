@@ -54,9 +54,9 @@ The embedded map uses OpenStreetMap tiles, and every property has an "Open in Go
 node test/api.test.js
 ```
 
-This starts the server on a temporary database and runs 207 checks: sign-up and login, Google sign-in (against a stand-in Google server), permissions for two owners and two agents, calculations against hand-calculated figures, reminders, uploads, location parsing, and security headers.
+This starts the server on a temporary database and runs 217 checks: sign-up and login, Google sign-in (against a stand-in Google server), permissions for two owners and two agents, calculations against hand-calculated figures, reminders, uploads, location parsing, and security headers.
 
-The browser test drives the pages in Chrome at computer and iPhone sizes (83 checks). It needs Playwright, which is not shipped with the site:
+The browser test drives the pages in Chrome at computer and iPhone sizes (87 checks). It needs Playwright, which is not shipped with the site:
 
 ```
 PLAYWRIGHT=/path/to/node_modules/playwright CHROME=/usr/bin/google-chrome node test/ui.test.js

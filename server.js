@@ -196,17 +196,20 @@ function tenantFields(body) {
   if (f.contract_end < f.contract_start) bad('contract_end: must be after the start date');
   return f;
 }
-// One expected rent payment per cheque, spread evenly over the contract. The last cheque takes any rounding difference.
+// One expected rent payment per cheque, spread evenly over the period. The last cheque takes any rounding difference.
+// Example: 80,000 in 4 cheques over 12 months = 20,000 every 3 months.
+function splitCheques(firstDate, months, total, count) {
+  const each = Math.floor(total / count * 100) / 100;
+  return Array.from({ length: count }, (_, i) => ({
+    due_date: addMonths(firstDate, Math.floor(i * months / count)),
+    amount: i === count - 1 ? Math.round((total - each * (count - 1)) * 100) / 100 : each,
+    note: `Cheque ${i + 1} of ${count}`,
+  }));
+}
 function chequeSchedule(f) {
   if (!f.cheques || !(f.annual_rent > 0)) return [];
   const months = monthsBetween(f.contract_start, f.contract_end);
-  const total = Math.round(f.annual_rent * months / 12 * 100) / 100;
-  const each = Math.floor(total / f.cheques * 100) / 100;
-  return Array.from({ length: f.cheques }, (_, i) => ({
-    due_date: addMonths(f.contract_start, Math.floor(i * months / f.cheques)),
-    amount: i === f.cheques - 1 ? Math.round((total - each * (f.cheques - 1)) * 100) / 100 : each,
-    note: `Cheque ${i + 1} of ${f.cheques}`,
-  }));
+  return splitCheques(f.contract_start, months, Math.round(f.annual_rent * months / 12 * 100) / 100, f.cheques);
 }
 
 // ---------- rate limiting ----------
@@ -621,6 +624,35 @@ route('POST', '/api/properties/:id/' + KIND_RE, async (c) => {
     }
   }
   return { id: Number(id), cheques_created: cheques };
+});
+
+// Quick entry: "4 cheques for 80,000" creates four payments of 20,000, three months apart.
+route('POST', '/api/properties/:id/cheques', async (c) => {
+  const { p } = loadProperty(c.user, c.params.id);
+  const b = await c.json();
+  let list;
+  if (Array.isArray(b.items)) {
+    // The user adjusted the suggested cheques: save exactly the dates and amounts they entered.
+    if (b.items.length < 1 || b.items.length > 24) bad('count: invalid number');
+    list = b.items.map((it, i) => {
+      if (!it || typeof it !== 'object') bad('items: invalid value');
+      const amount = V.money(true)(it.amount, 'amount');
+      if (!(amount > 0)) bad('amount: invalid amount');
+      return { due_date: V.date(true)(it.due_date, 'due_date'), amount, note: `Cheque ${i + 1} of ${b.items.length}` };
+    });
+  } else {
+    const total = V.money(true)(b.total, 'total');
+    if (!(total > 0)) bad('total: invalid amount');
+    const count = V.int(1, 24)(b.count, 'count');
+    const first = V.date(true)(b.first_date, 'first_date');
+    const months = b.months == null || b.months === '' ? 12 : V.int(1, 120)(b.months, 'months');
+    list = splitCheques(first, months, total, count);
+  }
+  if (b.preview === true) return { cheques: list, created: 0 };
+  for (const ch of list) {
+    q('INSERT INTO payments (property_id, due_date, amount, paid_date, note, created_by, created_at) VALUES (?,?,?,?,?,?,?)').run(p.id, ch.due_date, ch.amount, null, ch.note, c.user.id, now());
+  }
+  return { cheques: list, created: list.length };
 });
 
 function loadRecord(user, kind, id) {
