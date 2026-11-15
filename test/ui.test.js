@@ -6,6 +6,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { chromium } = require(process.env.PLAYWRIGHT || 'playwright');
+const { startFakeGoogle } = require('./fake-google');
+const GID = 'test-client-id.apps.googleusercontent.com';
+let google = null;
 
 const PORT = 4600 + Math.floor(Math.random() * 300);
 const BASE = 'http://127.0.0.1:' + PORT;
@@ -21,7 +24,7 @@ const problems = [];
 async function newPage(browser, opts) {
   const ctx = await browser.newContext(opts);
   const page = await ctx.newPage();
-  await page.route('**/*', (route) => (route.request().url().startsWith(BASE) ? route.continue() : route.abort()));
+  await page.route('**/*', (route) => (route.request().url().startsWith(BASE) || route.request().url().startsWith(google.origin) ? route.continue() : route.abort()));
   page.on('pageerror', (e) => problems.push('page error: ' + e.message));
   page.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource|ERR_FAILED|net::/.test(m.text())) problems.push('console: ' + m.text()); });
   return { ctx, page };
@@ -39,7 +42,8 @@ async function addRecord(page, kind, values) {
 }
 
 async function main() {
-  const server = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(PORT), DATA_DIR: DATA, FAKE_TODAY: '2026-11-13', NODE_NO_WARNINGS: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  google = await startFakeGoogle(GID);
+  const server = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(PORT), DATA_DIR: DATA, FAKE_TODAY: '2026-11-13', NODE_NO_WARNINGS: '1', GOOGLE_CLIENT_ID: GID, GOOGLE_CLIENT_SECRET: 'test-secret', OAUTH_TEST_AUTH_URL: google.authUrl, OAUTH_TEST_TOKEN_URL: google.tokenUrl }, stdio: ['ignore', 'pipe', 'pipe'] });
   let serverErr = '';
   server.stderr.on('data', (d) => { serverErr += d; });
   await new Promise((ok, no) => { server.stdout.on('data', (d) => { if (String(d).includes('running')) ok(); }); setTimeout(() => no(new Error('server start timeout')), 8000); });
@@ -234,17 +238,27 @@ async function main() {
     await ag.page.goto(BASE + '/#/settings'); await ag.page.waitForSelector('#agent-code');
     const agentCode = await ag.page.textContent('#agent-code');
     check('agent code is shown in Settings', /^[A-Z2-9]{8}$/.test(agentCode));
-    await ag.page.goto(BASE + '/#/new'); await ag.page.waitForSelector('#owner-select');
+    await ag.page.goto(BASE + '/#/new'); await ag.page.waitForSelector('#owner-name');
+    check('the owner box explains that it is a real name, not a username', /not a username/.test(await ag.page.textContent('#owner-note')));
     await ag.page.fill('input[name=name]', 'Client Flat');
     await ag.page.click('form.form-page button[type=submit]');
     await ag.page.waitForFunction(() => document.querySelector('form.form-page .form-error').textContent.length > 0);
-    check('agent cannot save a property without choosing an owner', /Choose an owner/.test(await ag.page.textContent('form.form-page .form-error')));
-    await ag.page.selectOption('#owner-select', 'new');
-    await ag.page.fill('input[name=owner_name]', 'Client Carl');
+    check('agent cannot save a property without naming the owner', /Type the name of the property owner/.test(await ag.page.textContent('form.form-page .form-error')));
+    await ag.page.fill('#owner-name', 'Client Carl');
+    check('a new name is announced as a new owner and asks for optional contact details', /New owner/.test(await ag.page.textContent('#owner-note')) && await ag.page.locator('input[name=owner_phone]').isVisible());
     await ag.page.click('form.form-page button[type=submit]');
     await ag.page.waitForSelector('.phead h1');
     check('agent registers a property for a new owner', /Client Carl/.test(await ag.page.textContent('.agent-box')) && (await ag.page.locator('#delete-property').count()) === 1);
+    await ag.page.click('#invite-owner');
+    await ag.page.waitForSelector('#invite-code');
+    check('"Invite owner to view" shows a code with plain instructions', /^[A-Z2-9]{10}$/.test(await ag.page.textContent('#invite-code')) && /Give this code to Client Carl/.test(await ag.page.textContent('dialog')));
+    await ag.page.goto(BASE + '/#/new'); await ag.page.waitForSelector('#owner-name');
+    await ag.page.fill('input[name=name]', 'Client Shop'); await ag.page.fill('#owner-name', 'client carl');
+    check('typing a known owner\'s name recognises them', /Already in your owner list \(1 properties\)/.test(await ag.page.textContent('#owner-note')) && !(await ag.page.locator('input[name=owner_phone]').isVisible()), await ag.page.textContent('#owner-note'));
+    await ag.page.click('form.form-page button[type=submit]');
+    await ag.page.waitForSelector('.phead h1');
     await ag.page.goto(BASE + '/#/clients'); await ag.page.waitForSelector('.tbl');
+    check('the second property is added to the same owner, not a duplicate', (await ag.page.locator('.tbl tbody tr').count()) === 1 && /Client Carl/.test(await ag.page.textContent('.tbl tbody')) && (await ag.page.locator('.tbl tbody td').nth(3).textContent()) === '2');
     await ag.page.getByText('Create link code').click();
     await ag.page.waitForSelector('code.code');
     check('agent creates a link code for the owner', /^[A-Z2-9]{10}$/.test(await ag.page.textContent('code.code')));
@@ -274,6 +288,27 @@ async function main() {
     check('after removal the agent is locked out again', /Not found/.test(await ag.page.textContent('.empty')));
     await ag.ctx.close();
 
+    group = 'Rent duration and cheques';
+    await page.goto(BASE + '/#/properties'); await page.waitForSelector('.pcard');
+    await page.locator('.pcard', { hasText: 'Shop 3' }).click();
+    await page.waitForSelector('[data-add=tenants]');
+    await page.click('[data-add="tenants"]');
+    check('the contract form offers duration and number of cheques', (await page.locator('dialog [name=duration_months]').count()) === 1 && (await page.locator('dialog select[name=cheques] option').count()) === 7);
+    await page.fill('dialog [name=name]', 'Shop Tenant'); await page.fill('dialog [name=contract_start]', '2026-11-01'); await page.fill('dialog [name=duration_months]', '12');
+    await page.fill('dialog [name=annual_rent]', '80000'); await page.selectOption('dialog [name=cheques]', '4');
+    await page.click('dialog button[type=submit]');
+    await page.waitForSelector('dialog', { state: 'detached' });
+    await page.waitForSelector('#contract-info');
+    check('the contract shows its dates, duration and cheque count', /1 Nov 2026 – 31 Oct 2027 · 12 months · 4 cheques/.test(await page.textContent('#contract-info')), await page.textContent('#contract-info'));
+    check('the tenants table shows the duration', /12 months/.test(await page.textContent('#tenants tbody')));
+    const cheq = await page.locator('#payments tbody tr', { hasText: 'Cheque' }).allTextContents();
+    check('four expected cheques of AED 20,000 are listed with their dates', cheq.length === 4 && cheq.every((x) => /20,000/.test(x)) && /1 Nov 2026/.test(cheq[0]) && /1 Feb 2027/.test(cheq[1]) && /1 May 2027/.test(cheq[2]) && /1 Aug 2027/.test(cheq[3]), cheq);
+    check('the first cheque is already overdue and the others are upcoming', /Rent overdue/.test(cheq[0]) && /Upcoming/.test(cheq[1]));
+    await page.locator('#tenants tbody tr', { hasText: 'Shop Tenant' }).getByText('Edit').click();
+    check('editing a contract does not offer to create cheques again', (await page.locator('dialog [name=cheques]').count()) === 0 && (await page.inputValue('dialog [name=contract_end]')) === '2027-10-31');
+    await page.click('dialog .dlg-actions button[type=button]');
+    await page.screenshot({ path: path.join(SHOTS, 'desktop-cheques.png'), fullPage: true });
+
     group = 'Log out';
     await page.goto(BASE + '/#/settings'); await page.waitForSelector('#logout');
     await page.click('#logout');
@@ -283,11 +318,41 @@ async function main() {
     const leak = await page.evaluate(() => fetch('/api/dashboard').then((r) => r.status));
     check('after logging out, data requests are refused', leak === 401);
 
+    group = 'Google sign-in';
+    const gg = await newPage(browser, { viewport: { width: 1440, height: 900 } });
+    google.nextUser = { sub: 'ui-1', email: 'gina@example.com', name: 'Gina Google' };
+    await gg.page.goto(BASE + '/#/login');
+    await gg.page.waitForSelector('#google-login');
+    check('the login page offers "Continue with Google"', /Continue with Google/.test(await gg.page.textContent('#google-login')));
+    await gg.page.screenshot({ path: path.join(SHOTS, 'desktop-login.png') });
+    await gg.page.click('#google-login');
+    await gg.page.waitForFunction(() => location.hash === '#/signup/google_role' && document.querySelector('.form-error'));
+    check('a new Google user is asked to choose owner or agent', /Choose owner or agent/.test(await gg.page.textContent('.form-error')));
+    await gg.page.check('input[value=agent]');
+    check('the Google button follows the chosen role', (await gg.page.getAttribute('#google-login', 'href')) === '/auth/google?role=agent');
+    await gg.page.click('#google-login');
+    await gg.page.waitForSelector('.empty');
+    check('signing up with Google as an agent lands on the dashboard, logged in', (await gg.page.locator('.side-links a[href="#/clients"]').count()) === 1 && /Gina Google/.test(await gg.page.textContent('.side-user')));
+    await gg.page.goto(BASE + '/#/settings'); await gg.page.waitForSelector('#logout');
+    check('Settings shows Google as the sign-in method and asks for no current password', /Google/.test(await gg.page.textContent('.dl')) && (await gg.page.locator('input[name=current]').count()) === 0 && (await gg.page.locator('input[name=next]').count()) === 1);
+    await gg.page.click('#logout');
+    await gg.page.waitForSelector('#google-login');
+    await gg.page.click('#google-login');
+    await gg.page.waitForSelector('.empty');
+    check('logging in again with Google goes straight to the dashboard', /Gina Google/.test(await gg.page.textContent('.side-user')));
+    google.nextUser = { sub: 'ui-2', email: 'nomail@example.com', email_verified: false };
+    await gg.page.goto(BASE + '/#/settings'); await gg.page.waitForSelector('#logout'); await gg.page.click('#logout');
+    await gg.page.waitForSelector('#google-login'); await gg.page.click('#google-login');
+    await gg.page.waitForFunction(() => location.hash === '#/login/google_unverified' && document.querySelector('.form-error'));
+    check('a failed Google sign-in returns to the login page with a clear message', /no verified email/.test(await gg.page.textContent('.form-error')));
+    await gg.ctx.close();
+
     group = 'Browser errors';
     check('no script errors or blocked-content warnings in the browser', problems.length === 0, problems);
   } finally {
     await browser.close();
     server.kill();
+    google.close();
     fs.rmSync(DATA, { recursive: true, force: true });
   }
   if (serverErr.trim()) console.log('\nServer error output:\n' + serverErr);

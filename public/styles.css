@@ -5,6 +5,7 @@
   --sans: Manrope, 'IBM Plex Sans Arabic', system-ui, -apple-system, 'Segoe UI', Tahoma, sans-serif;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 15px; line-height: 1.45; }
 [dir=rtl] body { font-family: 'IBM Plex Sans Arabic', Manrope, Tahoma, sans-serif; }
@@ -240,6 +241,11 @@ input[type=file] { color: var(--muted); font-size: 13px; }
 .roles span { display: flex; flex-direction: column; }
 .roles small { color: var(--muted); }
 .roles input { accent-color: var(--gold); width: 18px; height: 18px; }
+
+.divider { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; }
+.divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--line2); }
+.btn-google { background: var(--text); border-color: var(--text); color: #0B1310; font-weight: 700; }
+.btn-google:hover { background: #FFFFFF; color: #0B1310; }
 
 /* phone */
 @media (max-width: 860px) {

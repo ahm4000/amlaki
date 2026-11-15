@@ -70,6 +70,10 @@ CREATE INDEX IF NOT EXISTS ix_prop_owner ON properties(owner_user_id);
 CREATE INDEX IF NOT EXISTS ix_prop_agent ON properties(agent_id);
 `);
 
+if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'google_sub')) db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS ux_users_google ON users(google_sub)');
+if (!db.prepare('PRAGMA table_info(tenants)').all().some((c) => c.name === 'cheques')) db.exec('ALTER TABLE tenants ADD COLUMN cheques INTEGER NOT NULL DEFAULT 0');
+
 const stmts = new Map();
 const q = (sql) => { let s = stmts.get(sql); if (!s) { s = db.prepare(sql); stmts.set(sql, s); } return s; };
 
@@ -90,6 +94,15 @@ function addMonths(d, n) {
   const last = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
   first.setUTCDate(Math.min(day, last));
   return first.toISOString().slice(0, 10);
+}
+const addDays = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
+// Whole months covered by a contract, counting both the first and the last day (1 Mar to 28 Feb = 12).
+function monthsBetween(start, end) {
+  const e = new Date(Date.parse(end + 'T00:00:00Z') + 864e5);
+  const [y, m, d] = start.split('-').map(Number);
+  let n = (e.getUTCFullYear() - y) * 12 + (e.getUTCMonth() + 1 - m);
+  if (e.getUTCDate() < d) n--;
+  return Math.max(1, n);
 }
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const randomCode = (n) => Array.from({ length: n }, () => CODE_CHARS[crypto.randomInt(CODE_CHARS.length)]).join('');
@@ -121,6 +134,12 @@ const V = {
     if (v === '' || v == null || !Number.isInteger(n) || n < min || n > max) bad(k + ': invalid number');
     return n;
   },
+  optInt: (min, max) => (v, k) => {
+    if (v == null || v === '') return 0;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < min || n > max) bad(k + ': invalid number');
+    return n;
+  },
   one: (list, def) => (v, k) => {
     if ((v == null || v === '') && def) return def;
     if (!list.includes(v)) bad(k + ': invalid value');
@@ -146,7 +165,7 @@ const PROP_SPEC = {
   next_inspection: V.date(false), notes: V.str(0, 2000),
 };
 const KINDS = {
-  tenants: { name: V.str(1, 120), phone: V.str(0, 40), email: V.str(0, 160), contract_start: V.date(true), contract_end: V.date(true), annual_rent: V.money(false) },
+  tenants: { name: V.str(1, 120), phone: V.str(0, 40), email: V.str(0, 160), contract_start: V.date(true), contract_end: V.date(true), annual_rent: V.money(false), cheques: V.optInt(0, 24) },
   payments: { due_date: V.date(true), amount: V.money(true), paid_date: V.date(false), note: V.str(0, 300) },
   maintenance: { date: V.date(true), title: V.str(1, 160), contractor: V.str(0, 160), cost: V.money(false), notes: V.str(0, 1000) },
   reminders: { title: V.str(1, 160), interval_months: V.int(1, 120), next_due: V.date(true) },
@@ -164,6 +183,30 @@ function propFields(body) {
   f.rent_annual = period === 'monthly' ? Math.round(amount * 12 * 100) / 100 : amount;
   if (f.maps_url && !/^https:\/\//i.test(f.maps_url)) f.maps_url = '';
   return f;
+}
+
+// A contract can be entered with an end date or with a duration in months.
+function tenantFields(body) {
+  const b = { ...body };
+  if ((b.contract_end == null || b.contract_end === '') && b.duration_months != null && b.duration_months !== '') {
+    const months = V.int(1, 120)(b.duration_months, 'duration_months');
+    b.contract_end = addDays(addMonths(V.date(true)(b.contract_start, 'contract_start'), months), -1);
+  }
+  const f = clean(KINDS.tenants, b);
+  if (f.contract_end < f.contract_start) bad('contract_end: must be after the start date');
+  return f;
+}
+// One expected rent payment per cheque, spread evenly over the contract. The last cheque takes any rounding difference.
+function chequeSchedule(f) {
+  if (!f.cheques || !(f.annual_rent > 0)) return [];
+  const months = monthsBetween(f.contract_start, f.contract_end);
+  const total = Math.round(f.annual_rent * months / 12 * 100) / 100;
+  const each = Math.floor(total / f.cheques * 100) / 100;
+  return Array.from({ length: f.cheques }, (_, i) => ({
+    due_date: addMonths(f.contract_start, Math.floor(i * months / f.cheques)),
+    amount: i === f.cheques - 1 ? Math.round((total - each * (f.cheques - 1)) * 100) / 100 : each,
+    note: `Cheque ${i + 1} of ${f.cheques}`,
+  }));
 }
 
 // ---------- rate limiting ----------
@@ -194,9 +237,10 @@ async function checkPassword(pw, stored) {
   return want.length === got.length && crypto.timingSafeEqual(want, got);
 }
 const DUMMY_HASH = 'scrypt$' + '00'.repeat(16) + '$' + '00'.repeat(64);
+const NO_PASSWORD = 'none$00$00';   // marks an account that signs in with Google only
+const isSecure = (req) => process.env.COOKIE_SECURE === '1' || (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https');
 function cookie(req, value, maxAge) {
-  const secure = process.env.COOKIE_SECURE === '1' || (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https');
-  return `sid=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+  return `sid=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${isSecure(req) ? '; Secure' : ''}`;
 }
 function startSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
@@ -212,9 +256,78 @@ function currentUser(req) {
   if (!token) return null;
   const s = q('SELECT user_id, expires FROM sessions WHERE token_hash = ?').get(sha(token));
   if (!s || s.expires < Date.now()) return null;
-  return q('SELECT id, email, name, role, agent_code FROM users WHERE id = ?').get(s.user_id) || null;
+  return q('SELECT id, email, name, role, agent_code, google_sub, pass FROM users WHERE id = ?').get(s.user_id) || null;
 }
-const publicUser = (u) => ({ id: u.id, email: u.email, name: u.name, role: u.role, agent_code: u.role === 'agent' ? u.agent_code : null });
+const publicUser = (u) => ({ id: u.id, email: u.email, name: u.name, role: u.role, agent_code: u.role === 'agent' ? u.agent_code : null, google: !!u.google_sub, has_password: u.pass !== NO_PASSWORD });
+
+// ---------- Google sign-in (OpenID Connect, authorization-code flow) ----------
+const GOOGLE = {
+  id: process.env.GOOGLE_CLIENT_ID || '', secret: process.env.GOOGLE_CLIENT_SECRET || '',
+  authUrl: process.env.OAUTH_TEST_AUTH_URL || 'https://accounts.google.com/o/oauth2/v2/auth',     // overrides exist for the automated tests only
+  tokenUrl: process.env.OAUTH_TEST_TOKEN_URL || 'https://oauth2.googleapis.com/token',
+};
+const googleEnabled = () => !!(GOOGLE.id && GOOGLE.secret);
+function baseUrl(req) {
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '');
+  return (isSecure(req) ? 'https' : 'http') + '://' + req.headers.host;
+}
+const stateCookie = (req, value, maxAge) => `g_state=${value}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${isSecure(req) ? '; Secure' : ''}`;
+function redirect(res, location, cookies) {
+  if (cookies) res.setHeader('Set-Cookie', cookies);
+  res.writeHead(302, { Location: location, 'Cache-Control': 'no-store' });
+  res.end();
+}
+async function googleAuth(req, res, url) {
+  if (!googleEnabled()) notFound();
+  limit('gauth:' + clientIp(req), 40, 15 * 60 * 1000);
+  const redirectUri = baseUrl(req) + '/auth/google/callback';
+  if (url.pathname === '/auth/google') {
+    const asked = url.searchParams.get('role');
+    const role = asked === 'owner' || asked === 'agent' ? asked : '';
+    const state = crypto.randomBytes(24).toString('base64url'), nonce = crypto.randomBytes(24).toString('base64url');
+    const params = new URLSearchParams({ client_id: GOOGLE.id, redirect_uri: redirectUri, response_type: 'code', scope: 'openid email profile', state, nonce, prompt: 'select_account' });
+    return redirect(res, GOOGLE.authUrl + '?' + params, [stateCookie(req, `${state}.${nonce}.${role}`, 600)]);
+  }
+  // Callback from Google. The state cookie ties this reply to the browser that started the sign-in.
+  const fail = (code) => redirect(res, '/#/login/' + code, [stateCookie(req, '', 0)]);
+  const m = /(?:^|;\s*)g_state=([A-Za-z0-9_-]{20,})\.([A-Za-z0-9_-]{20,})\.(owner|agent|)(?:;|$)/.exec(req.headers.cookie || '');
+  const state = url.searchParams.get('state') || '', code = url.searchParams.get('code') || '';
+  if (!m || !code || code.length > 2000 || state.length !== m[1].length || !crypto.timingSafeEqual(Buffer.from(state), Buffer.from(m[1]))) return fail('google_failed');
+  let claims = null;
+  try {
+    const r = await fetch(GOOGLE.tokenUrl, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, signal: AbortSignal.timeout(8000),
+      body: new URLSearchParams({ code, client_id: GOOGLE.id, client_secret: GOOGLE.secret, redirect_uri: redirectUri, grant_type: 'authorization_code' }),
+    });
+    const j = await r.json();
+    if (r.ok && j && typeof j.id_token === 'string') claims = JSON.parse(Buffer.from(j.id_token.split('.')[1] || '', 'base64url').toString('utf8'));
+  } catch { claims = null; }
+  // The token comes straight from Google's token endpoint over HTTPS; its claims are still checked.
+  if (!claims || typeof claims !== 'object' || !['https://accounts.google.com', 'accounts.google.com'].includes(claims.iss) || claims.aud !== GOOGLE.id ||
+      !(Number(claims.exp) * 1000 > Date.now()) || claims.nonce !== m[2] || typeof claims.sub !== 'string' || !/^[\w.-]{1,64}$/.test(claims.sub)) return fail('google_failed');
+  if ((claims.email_verified !== true && claims.email_verified !== 'true') || typeof claims.email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(claims.email) || claims.email.length > 160) return fail('google_unverified');
+  const email = claims.email.trim().toLowerCase();
+  let user = q('SELECT * FROM users WHERE google_sub = ?').get(claims.sub);
+  if (!user) {
+    const existing = q('SELECT * FROM users WHERE email = ?').get(email);
+    if (existing) {
+      if (existing.google_sub) return fail('google_failed');
+      // Email addresses of password accounts are not verified, so linking removes the old password and logs out
+      // every device. Otherwise someone who pre-registered this email could keep access to the account.
+      q('UPDATE users SET google_sub = ?, pass = ? WHERE id = ?').run(claims.sub, NO_PASSWORD, existing.id);
+      q('DELETE FROM sessions WHERE user_id = ?').run(existing.id);
+      user = existing;
+    } else {
+      if (!m[3]) return redirect(res, '/#/signup/google_role', [stateCookie(req, '', 0)]);
+      const name = String(claims.name || email.split('@')[0]).replace(/[\u0000-\u001F]/g, '').trim().slice(0, 80) || 'User';
+      const id = q('INSERT INTO users (email, name, role, pass, agent_code, google_sub, created_at) VALUES (?,?,?,?,?,?,?)')
+        .run(email, name, m[3], NO_PASSWORD, m[3] === 'agent' ? randomCode(8) : null, claims.sub, now()).lastInsertRowid;
+      user = { id: Number(id) };
+    }
+  }
+  startSession(req, res, user.id);
+  return redirect(res, '/#/dashboard', [res.getHeader('Set-Cookie'), stateCookie(req, '', 0)]);
+}
 
 // ---------- access rules ----------
 // Owner: full control of properties they own. Agent: view/edit properties they manage;
@@ -248,6 +361,7 @@ function accessibleProperties(user) {
 function childrenOf(pid) {
   const out = {};
   for (const k of Object.keys(KINDS)) out[k] = q(`SELECT * FROM ${k} WHERE property_id = ? ORDER BY ${ORDER[k]}`).all(pid);
+  for (const t of out.tenants) t.duration_months = monthsBetween(t.contract_start, t.contract_end);
   out.files = q('SELECT id, property_id, kind, doc_type, name, mime, size, maintenance_id, created_by, created_at FROM files WHERE property_id = ? ORDER BY id').all(pid);
   return out;
 }
@@ -274,7 +388,8 @@ function summarize(p, ch, T, year) {
   if (active) status = daysUntil(T, active.contract_end) <= 90 ? 'renewal' : 'rented';
   if (overdue > 0) status = 'overdue';
   return { expected: p.rent_annual, received, outstanding, overdue, expenses, byCategory: { maintenance: maint, service, other },
-    net: sum([received, -expenses]), occupied: !!active, status, tenant: active ? active.name : null };
+    net: sum([received, -expenses]), occupied: !!active, status, tenant: active ? active.name : null,
+    contract: active ? { start: active.contract_start, end: active.contract_end, months: monthsBetween(active.contract_start, active.contract_end), cheques: active.cheques } : null };
 }
 function present(user, p, ch) {
   const acc = accessOf(user, p);
@@ -287,7 +402,7 @@ function present(user, p, ch) {
     maps_url: p.maps_url, rent_annual: p.rent_annual, rent_period: p.rent_period, next_inspection: p.next_inspection, notes: p.notes,
     owner_name: ownerUser ? ownerUser.name : contact ? contact.name : '', owner_linked: !!p.owner_user_id,
     agent_name: agent ? agent.name : null, agent_email: agent && acc === 'owner' ? agent.email : null,
-    cover_id: cover ? cover.id : null, role: acc,
+    cover_id: cover ? cover.id : null, role: acc, owner_contact_id: acc === 'agent' ? p.owner_contact_id : null,
     can: { assign_agent: acc === 'owner', delete: canDeleteProperty(user, acc, p) },
   };
 }
@@ -411,12 +526,13 @@ route('POST', '/api/logout', async (c) => {
 }, { public: true });
 
 route('GET', '/api/me', async (c) => publicUser(c.user));
+route('GET', '/api/config', async () => ({ google: googleEnabled() }), { public: true });
 
 route('POST', '/api/password', async (c) => {
   limit('pw:' + c.user.id, 10, 15 * 60 * 1000);
   const b = await c.json();
   const u = q('SELECT * FROM users WHERE id = ?').get(c.user.id);
-  if (!(await checkPassword(String(b.current || '').slice(0, 200), u.pass))) throw new HttpError(400, 'invalid_login');
+  if (u.pass !== NO_PASSWORD && !(await checkPassword(String(b.current || '').slice(0, 200), u.pass))) throw new HttpError(400, 'invalid_login');
   if (typeof b.next !== 'string' || b.next.length < 8 || b.next.length > 200) throw new HttpError(400, 'weak_password');
   q('UPDATE users SET pass = ? WHERE id = ?').run(await hashPassword(b.next), u.id);
   q('DELETE FROM sessions WHERE user_id = ?').run(u.id);
@@ -492,12 +608,19 @@ route('PUT', '/api/properties/:id/agent', async (c) => {
 route('POST', '/api/properties/:id/' + KIND_RE, async (c) => {
   const { p } = loadProperty(c.user, c.params.id);
   const kind = c.params.kind;
-  const f = clean(KINDS[kind], await c.json());
-  if (kind === 'tenants' && f.contract_end < f.contract_start) bad('contract_end: must be after the start date');
+  const body = await c.json();
+  const f = kind === 'tenants' ? tenantFields(body) : clean(KINDS[kind], body);
   const keys = Object.keys(f);
   const id = q(`INSERT INTO ${kind} (property_id, ${keys.join(', ')}, created_by, created_at) VALUES (?, ${keys.map(() => '?').join(', ')}, ?, ?)`)
     .run(p.id, ...keys.map((k) => f[k]), c.user.id, now()).lastInsertRowid;
-  return { id: Number(id) };
+  let cheques = 0;
+  if (kind === 'tenants') {
+    for (const ch of chequeSchedule(f)) {
+      q('INSERT INTO payments (property_id, due_date, amount, paid_date, note, created_by, created_at) VALUES (?,?,?,?,?,?,?)').run(p.id, ch.due_date, ch.amount, null, ch.note, c.user.id, now());
+      cheques++;
+    }
+  }
+  return { id: Number(id), cheques_created: cheques };
 });
 
 function loadRecord(user, kind, id) {
@@ -510,8 +633,8 @@ function loadRecord(user, kind, id) {
 route('PUT', '/api/records/' + KIND_RE + '/:id', async (c) => {
   const kind = c.params.kind;
   const { rec } = loadRecord(c.user, kind, c.params.id);
-  const f = clean(KINDS[kind], await c.json());
-  if (kind === 'tenants' && f.contract_end < f.contract_start) bad('contract_end: must be after the start date');
+  const body = await c.json();
+  const f = kind === 'tenants' ? tenantFields({ ...body, cheques: rec.cheques }) : clean(KINDS[kind], body);
   const keys = Object.keys(f);
   q(`UPDATE ${kind} SET ${keys.map((k) => k + ' = ?').join(', ')} WHERE id = ?`).run(...keys.map((k) => f[k]), rec.id);
   return { ok: true };
@@ -544,7 +667,7 @@ route('GET', '/api/records/(?<kind>tenants|payments|maintenance|reminders|expens
     const list = kind === 'files'
       ? q('SELECT id, property_id, kind, doc_type, name, mime, size, maintenance_id, created_by, created_at FROM files WHERE property_id = ? ORDER BY id DESC').all(p.id)
       : q(`SELECT * FROM ${kind} WHERE property_id = ? ORDER BY ${ORDER[kind]}`).all(p.id);
-    for (const r of list) rows.push({ ...r, property_name: p.name, can_delete: canDeleteRecord(c.user, acc, r) });
+    for (const r of list) rows.push({ ...r, ...(kind === 'tenants' ? { duration_months: monthsBetween(r.contract_start, r.contract_end) } : {}), property_name: p.name, can_delete: canDeleteRecord(c.user, acc, r) });
   }
   return { today: today(), rows };
 });
@@ -701,10 +824,11 @@ function serveStatic(req, res, pathname) {
 
 async function handle(req, res) {
   for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v);
-  if (process.env.COOKIE_SECURE === '1' || (TRUST_PROXY && req.headers['x-forwarded-proto'] === 'https')) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+  if (isSecure(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
   const url = new URL(req.url, 'http://localhost');
   if (!url.pathname.startsWith('/api/')) {
     if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed');
+    if (url.pathname === '/auth/google' || url.pathname === '/auth/google/callback') return googleAuth(req, res, url);
     return serveStatic(req, res, url.pathname);
   }
   if (req.method !== 'GET') {

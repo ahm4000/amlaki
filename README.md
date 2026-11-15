@@ -22,6 +22,8 @@ Then open http://localhost:3000. The database and uploaded files are created in 
 | `COOKIE_SECURE` | Set to `1` to always mark the login cookie as HTTPS-only | off |
 | `APP_TZ` | Time zone used for "today" | `Asia/Dubai` |
 | `MAX_USER_STORAGE_MB` | Upload allowance per user | `1024` |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Turn on "Continue with Google". See `GOOGLE-LOGIN-SETUP.md`. | off |
+| `PUBLIC_URL` | The site's public address, used for the Google sign-in return address | taken from the request |
 
 ## Putting it online
 
@@ -52,9 +54,9 @@ The embedded map uses OpenStreetMap tiles, and every property has an "Open in Go
 node test/api.test.js
 ```
 
-This starts the server on a temporary database and runs 163 checks: sign-up and login, permissions for two owners and two agents, calculations against hand-calculated figures, reminders, uploads, location parsing, and security headers.
+This starts the server on a temporary database and runs 207 checks: sign-up and login, Google sign-in (against a stand-in Google server), permissions for two owners and two agents, calculations against hand-calculated figures, reminders, uploads, location parsing, and security headers.
 
-The browser test drives the pages in Chrome at computer and iPhone sizes (65 checks). It needs Playwright, which is not shipped with the site:
+The browser test drives the pages in Chrome at computer and iPhone sizes (83 checks). It needs Playwright, which is not shipped with the site:
 
 ```
 PLAYWRIGHT=/path/to/node_modules/playwright CHROME=/usr/bin/google-chrome node test/ui.test.js
@@ -62,6 +64,7 @@ PLAYWRIGHT=/path/to/node_modules/playwright CHROME=/usr/bin/google-chrome node t
 
 ## Security measures
 
+- Google sign-in uses the standard authorization-code flow with a one-time state and nonce, and checks who the token was issued by and for.
 - Passwords hashed with scrypt and a per-user salt; sessions are random tokens stored hashed, in an HttpOnly, SameSite=Strict cookie; changing the password logs out other devices.
 - Login, sign-up, code entry, uploads and location lookups are rate limited.
 - Every write needs a custom header and a matching Origin, which blocks cross-site request forgery.

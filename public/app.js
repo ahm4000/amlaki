@@ -6,6 +6,7 @@
     set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
   };
   let me = null;
+  let config = { google: false };
   let lang = store.get('lang') === 'ar' ? 'ar' : 'en';
   let renderToken = 0;
 
@@ -159,7 +160,8 @@
   // ---------- record kinds ----------
   const KINDS = {
     payments: [{ name: 'due_date', type: 'date', required: true }, { name: 'amount', type: 'number', required: true }, { name: 'paid_date', type: 'date' }, { name: 'note', type: 'text', wide: true }],
-    tenants: [{ name: 'name', type: 'text', required: true, wide: true }, { name: 'phone', type: 'tel' }, { name: 'email', type: 'email' }, { name: 'contract_start', type: 'date', required: true }, { name: 'contract_end', type: 'date', required: true }, { name: 'annual_rent', type: 'number' }],
+    tenants: [{ name: 'name', type: 'text', required: true, wide: true }, { name: 'phone', type: 'tel' }, { name: 'email', type: 'email' }, { name: 'contract_start', type: 'date', required: true }, { name: 'duration_months', type: 'number', step: '1', createOnly: true, get hint() { return t('h.duration'); } }, { name: 'contract_end', type: 'date', get hint() { return t('h.contract_end'); } }, { name: 'annual_rent', type: 'number' },
+      { name: 'cheques', type: 'select', createOnly: true, wide: true, get options() { return [{ value: 0, label: t('cheques.none') }].concat([1, 2, 3, 4, 6, 12].map((n) => ({ value: n, label: t('cheques.n', { n }) }))); }, get hint() { return t('h.cheques'); } }],
     maintenance: [{ name: 'date', type: 'date', required: true }, { name: 'title', type: 'text', required: true }, { name: 'contractor', type: 'text' }, { name: 'cost', type: 'number' }, { name: 'notes', type: 'textarea', wide: true }],
     reminders: [{ name: 'title', type: 'text', required: true, wide: true }, { name: 'interval_months', type: 'number', required: true, step: '1' }, { name: 'next_due', type: 'date', required: true }],
     expenses: [{ name: 'date', type: 'date', required: true }, { name: 'category', type: 'select', required: true, get options() { return [{ value: 'service', label: t('d.cat.service') }, { value: 'other', label: t('d.cat.other') }]; } }, { name: 'amount', type: 'number', required: true }, { name: 'note', type: 'text', wide: true }],
@@ -172,7 +174,7 @@
   function columns(kind, today) {
     const c = {
       payments: [['f.due_date', (r) => fmtDate(r.due_date)], ['f.amount', (r) => aed(r.amount), 'num'], ['f.paid_date', (r) => (r.paid_date ? fmtDate(r.paid_date) : '—')], ['f.status', (r) => pill(paymentStatus(r, today))], ['f.note', (r) => r.note || '']],
-      tenants: [['f.name', (r) => r.name], ['f.phone', (r) => r.phone || '—'], ['f.email', (r) => r.email || '—'], ['f.contract_start', (r) => fmtDate(r.contract_start)], ['f.contract_end', (r) => fmtDate(r.contract_end)], ['f.annual_rent', (r) => aed(r.annual_rent), 'num']],
+      tenants: [['f.name', (r) => r.name], ['f.phone', (r) => r.phone || '—'], ['f.email', (r) => r.email || '—'], ['f.contract_start', (r) => fmtDate(r.contract_start)], ['f.contract_end', (r) => fmtDate(r.contract_end)], ['f.duration', (r) => t('months_n', { n: r.duration_months })], ['f.cheques', (r) => (r.cheques ? r.cheques : '—')], ['f.annual_rent', (r) => aed(r.annual_rent), 'num']],
       maintenance: [['f.date', (r) => fmtDate(r.date)], ['f.title', (r) => r.title], ['f.contractor', (r) => r.contractor || '—'], ['f.cost', (r) => aed(r.cost), 'num']],
       reminders: [['f.title', (r) => r.title], ['f.interval_months', (r) => t('p.every_months', { n: r.interval_months })], ['f.next_due', (r) => fmtDate(r.next_due)], ['f.status', (r) => { const d = dayDiff(today, r.next_due); return h('span', { class: 'pill st-' + (d < 0 ? 'overdue' : d <= 30 ? 'due' : 'upcoming') }, daysText(d)); }]],
       expenses: [['f.date', (r) => fmtDate(r.date)], ['f.category', (r) => t('d.cat.' + (r.category === 'service' ? 'service' : 'other'))], ['f.amount', (r) => aed(r.amount), 'num'], ['f.note', (r) => r.note || '']],
@@ -180,7 +182,7 @@
     return c[kind];
   }
   function recordForm(kind, propertyId, rec, done) {
-    formDialog(t(rec ? 'edit' : 'add') + ' · ' + t('kind.' + kind), KINDS[kind], rec, async (vals) => {
+    formDialog(t(rec ? 'edit' : 'add') + ' · ' + t('kind.' + kind), KINDS[kind].filter((f) => !rec || !f.createOnly), rec, async (vals) => {
       if (rec) await api('PUT', '/api/records/' + kind + '/' + rec.id, vals);
       else await api('POST', '/api/properties/' + propertyId + '/' + kind, vals);
       done();
@@ -300,9 +302,12 @@
   function langSwitch() {
     return h('div', { class: 'lang' }, ['en', 'ar'].map((l) => h('button', { type: 'button', class: lang === l ? 'on' : '', onclick: () => { lang = l; store.set('lang', l); render(); } }, l === 'en' ? 'English' : 'العربية')));
   }
-  function authPage(mode) {
+  function authPage(mode, note) {
     const signup = mode === 'signup';
     const error = h('p', { class: 'form-error', role: 'alert' });
+    if (note === 'google_role') error.textContent = t('auth.google_role');
+    else if (note === 'google_failed' || note === 'google_unverified') error.textContent = t('err.' + note);
+    const googleBtn = config.google ? h('a', { class: 'btn btn-block btn-google', id: 'google-login', href: '/auth/google' + (signup ? '?role=owner' : '') }, t('auth.google')) : null;
     const submit = h('button', { class: 'btn btn-primary btn-block', type: 'submit' }, t(signup ? 'auth.signup' : 'auth.login'));
     const form = h('form', { class: 'auth-form' },
       signup ? field({ name: 'name', type: 'text', required: true, label: t('auth.name') }) : null,
@@ -312,6 +317,7 @@
         h('label', {}, h('input', { type: 'radio', name: 'role', value: 'owner', checked: true }), h('span', {}, h('b', {}, t('auth.owner')), h('small', {}, t('auth.owner_hint')))),
         h('label', {}, h('input', { type: 'radio', name: 'role', value: 'agent' }), h('span', {}, h('b', {}, t('auth.agent')), h('small', {}, t('auth.agent_hint'))))) : null,
       error, submit);
+    if (googleBtn && signup) form.addEventListener('change', () => { googleBtn.href = '/auth/google?role=' + (form.querySelector('input[name=role]:checked') || { value: 'owner' }).value; });
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       submit.disabled = true;
@@ -326,6 +332,7 @@
       h('h1', {}, t(signup ? 'auth.signup_title' : 'auth.login_title')),
       h('p', { class: 'muted' }, t('auth.tagline')),
       form,
+      googleBtn ? [h('div', { class: 'divider' }, t('auth.or')), googleBtn, signup ? h('p', { class: 'muted center' }, t('auth.google_role_hint')) : null] : null,
       h('p', { class: 'muted center' }, h('a', { href: signup ? '#/login' : '#/signup' }, t(signup ? 'auth.to_login' : 'auth.to_signup'))),
       langSwitch()));
   }
@@ -457,7 +464,13 @@
       p.agent_name
         ? [h('span', {}, t('p.agent') + ': ', h('b', {}, p.agent_name), p.agent_email ? ' · ' + p.agent_email : ''), h('button', { class: 'btn-link danger', type: 'button', onclick: async () => { if (!(await confirmBox(t('p.remove_agent_q'), t('p.remove_agent')))) return; try { await api('PUT', '/api/properties/' + p.id + '/agent', { agent_code: null }); refresh(); } catch (e) { toast(e.message, true); } } }, t('p.remove_agent'))]
         : h('button', { class: 'btn-link', type: 'button', onclick: () => formDialog(t('p.assign'), [{ name: 'agent_code', type: 'text', required: true, wide: true, hint: t('p.agent_code_hint') }], null, async (v) => { await api('PUT', '/api/properties/' + p.id + '/agent', v); refresh(); }, t('p.assign')) }, '+ ' + t('p.assign')))
-      : h('div', { class: 'agent-box' }, h('span', {}, t('p.owner') + ': ', h('b', {}, p.owner_name || '—'), p.owner_linked ? '' : ' · ' + t('p.owner_not_linked')));
+      : h('div', { class: 'agent-box' }, h('span', {}, t('p.owner') + ': ', h('b', {}, p.owner_name || '—'), p.owner_linked ? '' : ' · ' + t('p.owner_not_linked')),
+        !p.owner_linked && p.owner_contact_id ? h('button', { class: 'btn-link', type: 'button', id: 'invite-owner', onclick: async () => {
+          try {
+            const r = await api('POST', '/api/contacts/' + p.owner_contact_id + '/code');
+            openDialog(t('p.invite_title'), h('div', { class: 'dlg-body' }, h('p', {}, h('code', { class: 'code big-code', id: 'invite-code' }, r.code)), h('p', {}, t('p.invite_text', { name: p.owner_name }))));
+          } catch (e) { toast(e.message, true); }
+        } }, t('p.invite')) : null);
 
     const mapHost = h('div', { class: 'map-host small' });
     if (p.lat != null) setTimeout(() => { if (mapHost.isConnected) new window.MiniMap(mapHost, { lat: p.lat, lng: p.lng, zoom: 15 }).setPin(p.lat, p.lng); }, 0);
@@ -489,6 +502,7 @@
         h('section', { class: 'card' }, h('h2', {}, t('p.info')),
           h('dl', { class: 'dl' },
             h('dt', {}, t('p.tenant')), h('dd', {}, s.tenant || t('st.vacant')),
+            s.contract ? [h('dt', {}, t('p.contract')), h('dd', { id: 'contract-info' }, fmtDate(s.contract.start) + ' – ' + fmtDate(s.contract.end) + ' · ' + t('months_n', { n: s.contract.months }) + (s.contract.cheques ? ' · ' + t('cheques.n', { n: s.contract.cheques }) : ''))] : null,
             h('dt', {}, t('f.next_inspection')), h('dd', {}, p.next_inspection ? fmtDate(p.next_inspection) + ' · ' + daysText(dayDiff(d.today, p.next_inspection)) : '—'),
             h('dt', {}, t('d.outstanding')), h('dd', {}, aed(s.outstanding)),
             h('dt', {}, t('f.notes')), h('dd', { class: 'pre' }, p.notes || '—')))),
@@ -567,10 +581,19 @@
     locInput.addEventListener('paste', () => setTimeout(find, 0));
     locInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); find(); } });
 
-    const ownerSel = h('select', { name: 'contact_id', id: 'owner-select' }, h('option', { value: '' }, t('pf.choose_owner')), contacts.map((c) => h('option', { value: c.id }, c.name)), h('option', { value: 'new' }, '+ ' + t('pf.add_new_owner')));
-    const newOwner = h('div', { class: 'form-grid', hidden: true }, field({ name: 'owner_name', type: 'text', label: t('f.new_owner'), required: true }), field({ name: 'owner_phone', type: 'tel', label: t('f.phone') }), field({ name: 'owner_email', type: 'email', label: t('f.email') }));
-    ownerSel.addEventListener('change', () => { newOwner.hidden = ownerSel.value !== 'new'; newOwner.querySelector('input').required = ownerSel.value === 'new'; });
-    newOwner.querySelector('input').required = false;
+    // Agent: one box for the owner's name. A name already in the agent's list is reused; a new name is added.
+    const ownerInput = h('input', { type: 'text', name: 'owner_name', id: 'owner-name', autocomplete: 'off', placeholder: t('pf.owner_placeholder') });
+    ownerInput.setAttribute('list', 'owner-list');
+    const ownerList = h('datalist', { id: 'owner-list' }, contacts.map((c) => h('option', { value: c.name })));
+    const ownerNote = h('small', { id: 'owner-note' }, t('pf.owner_hint'));
+    const ownerExtra = h('div', { class: 'form-grid', hidden: true }, field({ name: 'owner_phone', type: 'tel', label: t('pf.owner_phone') }), field({ name: 'owner_email', type: 'email', label: t('pf.owner_email') }));
+    const findOwner = () => contacts.find((c) => c.name.trim().toLowerCase() === ownerInput.value.trim().toLowerCase());
+    ownerInput.addEventListener('input', () => {
+      const match = findOwner(), typed = ownerInput.value.trim();
+      ownerNote.textContent = match ? t('pf.owner_existing', { n: match.properties }) : typed ? t('pf.owner_new') : t('pf.owner_hint');
+      ownerNote.className = match ? 'ok-text' : '';
+      ownerExtra.hidden = !typed || !!match;
+    });
 
     const amount = p.rent_annual != null ? (p.rent_period === 'monthly' ? Math.round((p.rent_annual / 12) * 100) / 100 : p.rent_annual) : '';
     const photoInput = h('input', { type: 'file', accept: 'image/*', multiple: true, id: 'new-photos' });
@@ -580,7 +603,7 @@
       h('div', { class: 'form-grid' },
         field({ name: 'name', type: 'text', required: true }, p.name),
         field({ name: 'type', type: 'select', required: true, options: ['villa', 'apartment', 'shop', 'land', 'other'].map((x) => ({ value: x, label: t('type.' + x) })) }, p.type),
-        !editing && me.role === 'agent' ? h('div', { class: 'field field-wide' }, h('label', { for: 'owner-select' }, t('f.owner')), ownerSel, newOwner) : null,
+        !editing && me.role === 'agent' ? h('div', { class: 'field field-wide' }, h('label', { for: 'owner-name' }, t('pf.owner_label')), ownerInput, ownerList, ownerNote, ownerExtra) : null,
         !editing && me.role === 'owner' ? field({ name: 'agent_code', type: 'text', hint: t('p.agent_code_hint'), wide: true }) : null,
         field({ name: 'address', type: 'text', wide: true }, p.address),
         field({ name: 'emirate', type: 'select', options: [{ value: '', label: '—' }].concat(EMIRATES.map((x) => ({ value: x, label: t('em.' + x) }))) }, p.emirate),
@@ -602,9 +625,10 @@
       const body = { name: v.name, type: v.type, address: v.address, emirate: v.emirate, area: v.area, rent_amount: v.rent_amount, rent_period: v.rent_period, next_inspection: v.next_inspection, notes: v.notes, lat, lng, maps_url: mapsUrl };
       if (!editing && me.role === 'owner' && v.agent_code) body.agent_code = v.agent_code;
       if (!editing && me.role === 'agent') {
-        if (v.contact_id === 'new') body.new_contact = { name: v.owner_name, phone: v.owner_phone, email: v.owner_email };
-        else if (v.contact_id) body.contact_id = Number(v.contact_id);
-        else { error.textContent = t('pf.owner_required'); return; }
+        const match = findOwner();
+        if (match) body.contact_id = match.id;
+        else if (ownerInput.value.trim()) body.new_contact = { name: ownerInput.value.trim(), phone: v.owner_phone, email: v.owner_email };
+        else { error.textContent = t('pf.owner_required'); ownerInput.focus(); return; }
       }
       submit.disabled = true;
       error.textContent = '';
@@ -642,12 +666,12 @@
     const claimForm = h('form', { class: 'inline' }, h('input', { name: 'code', type: 'text', required: true, placeholder: 'XXXXXXXXXX', 'aria-label': t('s.claim'), autocomplete: 'off' }), h('button', { class: 'btn btn-outline', type: 'submit' }, t('s.claim_btn')));
     claimForm.addEventListener('submit', async (e) => { e.preventDefault(); try { const r = await api('POST', '/api/claim', { code: claimForm.code.value }); msg(claimMsg, t('s.claimed', { n: r.properties }), true); claimForm.reset(); } catch (err) { msg(claimMsg, err.message); } });
     const pwMsg = h('p', { role: 'status' });
-    const pwForm = h('form', { class: 'form-grid' }, field({ name: 'current', type: 'password', required: true, label: t('s.current') }), field({ name: 'next', type: 'password', required: true, label: t('s.new'), hint: t('auth.pw_hint') }), h('div', { class: 'field field-wide' }, h('button', { class: 'btn btn-outline', type: 'submit' }, t('s.change'))));
-    pwForm.addEventListener('submit', async (e) => { e.preventDefault(); try { await api('POST', '/api/password', Object.fromEntries(new FormData(pwForm).entries())); msg(pwMsg, t('s.pw_changed'), true); pwForm.reset(); } catch (err) { msg(pwMsg, err.message); } });
+    const pwForm = h('form', { class: 'form-grid' }, me.has_password ? field({ name: 'current', type: 'password', required: true, label: t('s.current') }) : h('p', { class: 'muted field-wide' }, t('s.no_password')), field({ name: 'next', type: 'password', required: true, label: t('s.new'), hint: t('auth.pw_hint') }), h('div', { class: 'field field-wide' }, h('button', { class: 'btn btn-outline', type: 'submit' }, t('s.change'))));
+    pwForm.addEventListener('submit', async (e) => { e.preventDefault(); try { await api('POST', '/api/password', Object.fromEntries(new FormData(pwForm).entries())); me.has_password = true; msg(pwMsg, t('s.pw_changed'), true); pwForm.reset(); } catch (err) { msg(pwMsg, err.message); } });
     return h('div', { class: 'page narrow' }, pageHead(t('nav.settings')),
       h('section', { class: 'card more-links' }, h('h2', {}, t('s.more')), h('div', { class: 'chips' }, navItems().filter(([k]) => !['dashboard', 'properties', 'settings'].includes(k)).map(([k, href]) => h('a', { class: 'chip', href }, icon(k), t('nav.' + k))))),
       h('section', { class: 'card' }, h('h2', {}, t('s.language')), langSwitch()),
-      h('section', { class: 'card' }, h('h2', {}, t('s.account')), h('dl', { class: 'dl' }, h('dt', {}, t('auth.name')), h('dd', {}, me.name), h('dt', {}, t('auth.email')), h('dd', {}, me.email), h('dt', {}, t('auth.role')), h('dd', {}, t('auth.' + me.role)))),
+      h('section', { class: 'card' }, h('h2', {}, t('s.account')), h('dl', { class: 'dl' }, h('dt', {}, t('auth.name')), h('dd', {}, me.name), h('dt', {}, t('auth.email')), h('dd', {}, me.email), h('dt', {}, t('auth.role')), h('dd', {}, t('auth.' + me.role)), h('dt', {}, t('s.signin')), h('dd', {}, [me.google ? 'Google' : null, me.has_password ? t('auth.password') : null].filter(Boolean).join(' + ')))),
       me.role === 'agent' ? h('section', { class: 'card' }, h('h2', {}, t('s.agent_code')), h('p', {}, h('code', { class: 'code big-code', id: 'agent-code' }, me.agent_code)), h('p', { class: 'muted' }, t('s.agent_code_hint'))) : null,
       me.role === 'owner' ? h('section', { class: 'card' }, h('h2', {}, t('s.claim')), h('p', { class: 'muted' }, t('s.claim_hint')), claimForm, claimMsg) : null,
       h('section', { class: 'card' }, h('h2', {}, t('s.password')), pwForm, pwMsg),
@@ -662,7 +686,7 @@
     document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
     for (const d of document.querySelectorAll('dialog')) d.remove();
     const [page, arg] = location.hash.replace(/^#\/?/, '').split('/');
-    if (!me) { root.replaceChildren(authPage(page === 'signup' ? 'signup' : 'login')); return; }
+    if (!me) { root.replaceChildren(authPage(page === 'signup' ? 'signup' : 'login', arg)); return; }
     const name = PAGES[page] ? page : 'dashboard';
     const active = name === 'list' ? arg : ['property', 'new', 'edit'].includes(name) ? 'properties' : name;
     if (!root.querySelector('.shell')) root.replaceChildren(shell(active, h('p', { class: 'loading' }, t('loading'))));
@@ -675,6 +699,7 @@
   }
   window.addEventListener('hashchange', render);
   (async () => {
+    try { config = await api('GET', '/api/config'); } catch { /* keep defaults */ }
     try { me = await api('GET', '/api/me'); } catch { me = null; }
     render();
   })();

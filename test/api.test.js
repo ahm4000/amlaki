@@ -6,6 +6,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { parseCoords, resolveLocation, allowedUrl } = require('../lib/location');
+const { startFakeGoogle } = require('./fake-google');
+const GID = 'test-client-id.apps.googleusercontent.com';
 
 const PORT = 4100 + Math.floor(Math.random() * 400);
 const BASE = 'http://127.0.0.1:' + PORT;
@@ -41,8 +43,10 @@ class Client {
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
 
 async function main() {
+  const google = await startFakeGoogle(GID);
   const server = spawn(process.execPath, ['server.js'], {
-    cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(PORT), DATA_DIR: DATA, FAKE_TODAY: '2026-11-13', MAX_USER_STORAGE_MB: '1', NODE_NO_WARNINGS: '1' }, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(PORT), DATA_DIR: DATA, FAKE_TODAY: '2026-11-13', MAX_USER_STORAGE_MB: '1', NODE_NO_WARNINGS: '1',
+      GOOGLE_CLIENT_ID: GID, GOOGLE_CLIENT_SECRET: 'test-secret', OAUTH_TEST_AUTH_URL: google.authUrl, OAUTH_TEST_TOKEN_URL: google.tokenUrl }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   let serverErr = '';
   server.stderr.on('data', (d) => { serverErr += d; });
@@ -55,7 +59,7 @@ async function main() {
     let r = await A.post('/api/signup', { email: 'OwnerA@example.com', name: 'Ahmed Owner', password: 'correct horse 1', role: 'owner' });
     check('owner A signs up', r.status === 200 && r.json.role === 'owner' && r.json.email === 'ownera@example.com', r.json);
     check('session cookie is HttpOnly and SameSite=Strict', /HttpOnly/.test(A.setCookie) && /SameSite=Strict/.test(A.setCookie), A.setCookie);
-    check('password hash is never returned', !/pass|scrypt/.test(r.text));
+    check('password hash is never returned', !/scrypt|"pass"/.test(r.text));
     r = await B.post('/api/signup', { email: 'ownerb@example.com', name: 'Badr Owner', password: 'another pass 2', role: 'owner' });
     check('owner B signs up', r.status === 200);
     r = await X.post('/api/signup', { email: 'agentx@example.com', name: 'Xavier Agent', password: 'agent pass x1', role: 'agent' });
@@ -162,6 +166,68 @@ async function main() {
     r = await A.post('/api/reminders/' + rem + '/done', { date: '2026-11-24', cost: 1000, contractor: 'Cool Air LLC' });
     const after = (await A.get('/api/properties/' + v12)).json;
     check('marking a reminder done logs maintenance and moves it 6 months on', r.status === 200 && after.reminders[0].next_due === '2027-05-24' && after.maintenance.some((m) => m.date === '2026-11-24' && m.cost === 1000), after.reminders);
+
+    group = 'Rent duration and cheques';
+    const durProp = (await mk(A, { name: 'Duration Test', type: 'villa' })).json.id;
+    const addTen = (b) => A.post('/api/properties/' + durProp + '/tenants', { name: 'Dura Tenant', ...b });
+    const pays = async () => (await A.get('/api/properties/' + durProp)).json.payments;
+    r = await addTen({ contract_start: '2027-03-01', duration_months: 12, annual_rent: 120000, cheques: 4 });
+    let dp = (await A.get('/api/properties/' + durProp)).json;
+    check('a 12-month duration from 1 Mar 2027 sets the end date to 29 Feb 2028', r.status === 200 && dp.tenants[0].contract_end === '2028-02-29' && dp.tenants[0].duration_months === 12 && dp.tenants[0].cheques === 4, dp.tenants[0]);
+    check('four cheques of 30,000 are expected on 1 Mar, 1 Jun, 1 Sep and 1 Dec', r.json.cheques_created === 4 && dp.payments.map((x) => x.due_date + ':' + x.amount).join(' ') === '2027-03-01:30000 2027-06-01:30000 2027-09-01:30000 2027-12-01:30000', dp.payments);
+    check('each expected cheque is unpaid and labelled', dp.payments.every((x, i) => x.paid_date === null && x.note === `Cheque ${i + 1} of 4`));
+    for (const x of dp.payments) await A.del('/api/records/payments/' + x.id);
+    r = await addTen({ contract_start: '2029-01-15', contract_end: '2030-01-14', annual_rent: 100000, cheques: 3 });
+    let ps = await pays();
+    check('an uneven split adds up exactly (33,333.33 + 33,333.33 + 33,333.34)', ps.map((x) => x.amount).join(' ') === '33333.33 33333.33 33333.34' && ps.map((x) => x.due_date).join(' ') === '2029-01-15 2029-05-15 2029-09-15', ps);
+    for (const x of ps) await A.del('/api/records/payments/' + x.id);
+    r = await addTen({ contract_start: '2031-05-01', contract_end: '2031-10-31', annual_rent: 60000, cheques: 2 });
+    ps = await pays();
+    check('a 6-month contract at 60,000 a year expects 2 cheques of 15,000, three months apart', ps.map((x) => x.due_date + ':' + x.amount).join(' ') === '2031-05-01:15000 2031-08-01:15000' && (await A.get('/api/properties/' + durProp)).json.tenants[0].duration_months === 6, ps);
+    for (const x of ps) await A.del('/api/records/payments/' + x.id);
+    r = await addTen({ contract_start: '2033-01-01', duration_months: 12, annual_rent: 50000, cheques: 0 });
+    check('choosing no cheques creates none', r.json.cheques_created === 0 && (await pays()).length === 0);
+    r = await addTen({ contract_start: '2034-01-01', duration_months: 12, cheques: 4 });
+    check('no rent amount means no cheques are created', r.json.cheques_created === 0 && (await pays()).length === 0);
+    r = await addTen({ contract_start: '2035-01-31', duration_months: 1, annual_rent: 12000, cheques: 1 });
+    ps = await pays();
+    check('a 1-month contract from 31 Jan ends on 27 Feb with one cheque of 1,000', (await A.get('/api/properties/' + durProp)).json.tenants[0].contract_end === '2035-02-27' && ps.length === 1 && ps[0].amount === 1000, ps);
+    const tenId = (await A.get('/api/properties/' + durProp)).json.tenants[0].id;
+    r = await A.put('/api/records/tenants/' + tenId, { name: 'Renamed', contract_start: '2035-01-31', contract_end: '2035-12-31', annual_rent: 12000, cheques: 12 });
+    dp = (await A.get('/api/properties/' + durProp)).json;
+    check('editing a contract does not create more cheques', r.status === 200 && dp.payments.length === 1 && dp.tenants[0].name === 'Renamed' && dp.tenants[0].cheques === 1 && dp.tenants[0].duration_months === 11, dp.tenants[0]);
+    check('a contract needs an end date or a duration', (await addTen({ contract_start: '2036-01-01' })).status === 400);
+    check('a duration of 0 or 500 months is refused', (await addTen({ contract_start: '2036-01-01', duration_months: 0 })).status === 400 && (await addTen({ contract_start: '2036-01-01', duration_months: 500 })).status === 400);
+    check('99 cheques is refused', (await addTen({ contract_start: '2036-01-01', duration_months: 12, annual_rent: 1000, cheques: 99 })).status === 400);
+    r = await A.get('/api/properties/' + v12);
+    check('existing contracts show their duration (1 Mar 2026 to 28 Feb 2027 = 12 months)', r.json.tenants[0].duration_months === 12 && r.json.summary.contract.months === 12 && r.json.summary.contract.end === '2027-02-28');
+    check('contract durations appear in the all-tenants list', (await A.get('/api/records/tenants')).json.rows.every((x) => x.duration_months >= 1));
+    await A.del('/api/properties/' + durProp);
+
+    group = 'Upgrade from the previous version';
+    {
+      const { DatabaseSync } = require('node:sqlite');
+      const D3 = fs.mkdtempSync(path.join(os.tmpdir(), 'amlaki-old-')), P3 = PORT + 2;
+      const old = new DatabaseSync(path.join(D3, 'app.db'));
+      old.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('owner','agent')), pass TEXT NOT NULL, agent_code TEXT UNIQUE, created_at TEXT NOT NULL);
+        CREATE TABLE properties (id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, owner_user_id INTEGER, owner_contact_id INTEGER, agent_id INTEGER, created_by INTEGER NOT NULL, address TEXT, emirate TEXT, area TEXT, lat REAL, lng REAL, maps_url TEXT, rent_annual REAL NOT NULL DEFAULT 0, rent_period TEXT NOT NULL DEFAULT 'annual', next_inspection TEXT, notes TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE tenants (id INTEGER PRIMARY KEY, property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE, name TEXT NOT NULL, phone TEXT, email TEXT, contract_start TEXT NOT NULL, contract_end TEXT NOT NULL, annual_rent REAL NOT NULL DEFAULT 0, created_by INTEGER NOT NULL, created_at TEXT NOT NULL);`);
+      old.close();
+      const env3 = { ...process.env, PORT: String(P3), DATA_DIR: D3, FAKE_TODAY: '2026-11-13', NODE_NO_WARNINGS: '1' };
+      const run = () => new Promise((ok) => { const pr = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: env3, stdio: ['ignore', 'pipe', 'ignore'] }); pr.stdout.on('data', (d) => { if (String(d).includes('running')) ok(pr); }); setTimeout(() => ok(pr), 5000); });
+      const call = async (cl, m, u, b2) => { const res = await fetch('http://127.0.0.1:' + P3 + u, { method: m, headers: { 'content-type': 'application/json', 'x-requested-with': 'amlaki', cookie: cl.cookie || '' }, body: b2 ? JSON.stringify(b2) : undefined }); const sc = res.headers.get('set-cookie'); if (sc) cl.cookie = sc.split(';')[0]; return { status: res.status, json: await res.json().catch(() => null) }; };
+      let pr = await run();
+      const U = {};
+      const su = await call(U, 'POST', '/api/signup', { email: 'old@example.com', name: 'Old User', password: 'old password 1', role: 'owner' });
+      const op = (await call(U, 'POST', '/api/properties', { name: 'Old Villa', type: 'villa', rent_amount: 1000 })).json.id;
+      const ot = await call(U, 'POST', '/api/properties/' + op + '/tenants', { name: 'Old Tenant', contract_start: '2026-01-01', contract_end: '2026-12-31' });
+      pr.kill(); await new Promise((ok) => setTimeout(ok, 300));
+      pr = await run();   // second start on the already-upgraded database
+      const again = await call(U, 'GET', '/api/properties/' + op);
+      pr.kill(); fs.rmSync(D3, { recursive: true, force: true });
+      check('a database from the previous version is upgraded and works', su.status === 200 && ot.status === 200);
+      check('data survives a restart after the upgrade', again.status === 200 && again.json.tenants[0].name === 'Old Tenant' && again.json.tenants[0].duration_months === 12 && again.json.tenants[0].cheques === 0, again.json);
+    }
 
     group = 'Validation';
     r = await A.post('/api/properties/' + v12 + '/payments', { due_date: '2026-02-31', amount: 100 });
@@ -349,6 +415,79 @@ async function main() {
     r = await A.req('POST', '/api/login', undefined, { raw: Buffer.from('{bad json'), headers: { 'content-type': 'application/json' } });
     check('broken input gives a clean error, not a crash', r.status === 400 || r.status === 415);
 
+    group = 'Google sign-in';
+    const gStart = async (role) => {
+      const res = await fetch(BASE + '/auth/google' + (role ? '?role=' + role : ''), { redirect: 'manual' });
+      const raw = res.headers.getSetCookie()[0] || '';
+      return { status: res.status, loc: new URL(res.headers.get('location')), raw, cookie: raw.split(';')[0] };
+    };
+    const gBack = async (start, claims, opt = {}) => {
+      const code = Buffer.from(JSON.stringify({ nonce: start.loc.searchParams.get('nonce'), ...claims })).toString('base64url');
+      const res = await fetch(BASE + '/auth/google/callback?code=' + code + '&state=' + (opt.state || start.loc.searchParams.get('state')), { redirect: 'manual', headers: opt.noCookie ? {} : { cookie: start.cookie } });
+      const set = res.headers.getSetCookie();
+      const sid = set.find((x) => x.startsWith('sid=') && !x.startsWith('sid=;'));
+      const cl = new Client(); cl.cookie = sid ? sid.split(';')[0] : '';
+      return { status: res.status, location: res.headers.get('location'), sid, set, client: cl };
+    };
+    check('the site reports that Google sign-in is switched on', (await anon.get('/api/config')).json.google === true);
+    let g = await gStart('owner');
+    check('starting Google sign-in sends the browser to Google with the right details', g.status === 302 && g.loc.href.startsWith(google.authUrl) && g.loc.searchParams.get('client_id') === GID && g.loc.searchParams.get('redirect_uri') === BASE + '/auth/google/callback' && /openid/.test(g.loc.searchParams.get('scope')) && /email/.test(g.loc.searchParams.get('scope')) && g.loc.searchParams.get('response_type') === 'code' && g.loc.searchParams.get('state').length >= 20 && g.loc.searchParams.get('nonce').length >= 20);
+    check('the sign-in attempt is tied to the browser with a protected cookie', /HttpOnly/.test(g.raw) && /SameSite=Lax/.test(g.raw) && /Path=\/auth/.test(g.raw) && /Max-Age=600/.test(g.raw));
+    let b = await gBack(g, { sub: 'g-1001', email: 'Gina@Example.com', name: 'Gina Google' });
+    check('a new owner signs up with Google and is logged in', b.status === 302 && b.location === '/#/dashboard' && !!b.sid && /HttpOnly/.test(b.sid) && /SameSite=Strict/.test(b.sid));
+    let gm = (await b.client.get('/api/me')).json;
+    check('the Google account becomes an owner with the Google email and no password', gm && gm.role === 'owner' && gm.email === 'gina@example.com' && gm.name === 'Gina Google' && gm.google === true && gm.has_password === false, gm);
+    check('the one-time sign-in cookie is cleared afterwards', b.set.some((x) => x.startsWith('g_state=;') && /Max-Age=0/.test(x)));
+    const tr = google.tokenRequests[google.tokenRequests.length - 1];
+    check('the server exchanges the code with Google using its secret', tr.client_id === GID && tr.client_secret === 'test-secret' && tr.grant_type === 'authorization_code' && tr.redirect_uri === BASE + '/auth/google/callback');
+    const ginaId = gm.id;
+    b = await gBack(await gStart(), { sub: 'g-1001', email: 'gina@example.com' });
+    check('logging in again with the same Google account opens the same account', b.location === '/#/dashboard' && (await b.client.get('/api/me')).json.id === ginaId);
+    b = await gBack(await gStart(), { sub: 'g-2002', email: 'newperson@example.com' });
+    check('a new Google user must choose owner or agent first', b.location === '/#/signup/google_role' && !b.sid && (await anon.post('/api/login', { email: 'newperson@example.com', password: 'x' })).status === 401);
+    b = await gBack(await gStart('admin'), { sub: 'g-2002', email: 'newperson@example.com' });
+    check('an invented role is ignored', b.location === '/#/signup/google_role' && !b.sid);
+    b = await gBack(await gStart('agent'), { sub: 'g-2002', email: 'newperson@example.com', name: '<b>Neo</b>' });
+    gm = (await b.client.get('/api/me')).json;
+    check('a new agent signs up with Google and gets an agent code', b.location === '/#/dashboard' && gm.role === 'agent' && /^[A-Z2-9]{8}$/.test(gm.agent_code) && gm.name === '<b>Neo</b>');
+    g = await gStart('owner');
+    check('a reply with the wrong state is refused', (b = await gBack(g, { sub: 'g-3', email: 'x3@example.com' }, { state: 'A'.repeat(32) })).location === '/#/login/google_failed' && !b.sid);
+    check('a reply without the browser cookie is refused', (b = await gBack(g, { sub: 'g-3', email: 'x3@example.com' }, { noCookie: true })).location === '/#/login/google_failed' && !b.sid);
+    const other = await gStart('owner');
+    check('a reply meant for another browser is refused', (b = await gBack(g, { sub: 'g-3', email: 'x3@example.com' }, { state: other.loc.searchParams.get('state') })).location === '/#/login/google_failed' && !b.sid);
+    const bad = async (claims) => { const x = await gBack(await gStart('owner'), claims); return x.location === '/#/login/google_failed' && !x.sid; };
+    check('a token issued for a different website is refused', await bad({ sub: 'g-4', email: 'x4@example.com', aud: 'someone-else.apps.googleusercontent.com' }));
+    check('an expired token is refused', await bad({ sub: 'g-4', email: 'x4@example.com', exp: Math.floor(Date.now() / 1000) - 10 }));
+    check('a token with the wrong one-time number is refused', await bad({ sub: 'g-4', email: 'x4@example.com', nonce: 'B'.repeat(32) }));
+    check('a token not issued by Google is refused', await bad({ sub: 'g-4', email: 'x4@example.com', iss: 'https://evil.example' }));
+    check('a rejected code is refused', await bad({ reject: true }));
+    b = await gBack(await gStart('owner'), { sub: 'g-4', email: 'x4@example.com', email_verified: false });
+    check('a Google account with an unverified email is refused', b.location === '/#/login/google_unverified' && !b.sid);
+    check('none of the refused attempts created an account', (await anon.post('/api/signup', { email: 'x4@example.com', name: 'X4', password: 'free to register', role: 'owner' })).status === 200);
+    const P = new Client();
+    await P.post('/api/signup', { email: 'pat@example.com', name: 'Pat Password', password: 'pat password 1', role: 'owner' });
+    const patId = (await P.get('/api/me')).json.id;
+    const patProp = (await mk(P, { name: 'Pat Villa', type: 'villa' })).json.id;
+    b = await gBack(await gStart(), { sub: 'g-5005', email: 'pat@example.com' });
+    gm = (await b.client.get('/api/me')).json;
+    check('Google sign-in links to an existing account with the same email and keeps its data', b.location === '/#/dashboard' && gm.id === patId && gm.google === true && (await b.client.get('/api/properties/' + patProp)).status === 200);
+    check('linking removes the old password and logs out old devices', gm.has_password === false && (await P.get('/api/me')).status === 401 && (await new Client().post('/api/login', { email: 'pat@example.com', password: 'pat password 1' })).status === 401);
+    check('a different Google account cannot take over an email already linked', await bad({ sub: 'g-9999', email: 'pat@example.com' }));
+    check('a Google-only account can set a password and then log in with it', (await b.client.post('/api/password', { next: 'pat new password' })).status === 200 && (await new Client().post('/api/login', { email: 'pat@example.com', password: 'pat new password' })).json.has_password === true);
+    check('the Google pages accept only normal page loads', (await anon.req('POST', '/auth/google', {})).status === 405);
+    let lastG = 0;
+    for (let i = 0; i < 45 && lastG !== 429; i++) lastG = (await fetch(BASE + '/auth/google', { redirect: 'manual' })).status;
+    check('repeated Google sign-in attempts are rate limited', lastG === 429);
+    const P2 = PORT + 1, D2 = fs.mkdtempSync(path.join(os.tmpdir(), 'amlaki-test2-'));
+    const env2 = { ...process.env, PORT: String(P2), DATA_DIR: D2, NODE_NO_WARNINGS: '1' };
+    delete env2.GOOGLE_CLIENT_ID; delete env2.GOOGLE_CLIENT_SECRET;
+    const plain = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: env2, stdio: ['ignore', 'pipe', 'ignore'] });
+    await new Promise((ok) => { plain.stdout.on('data', (d) => { if (String(d).includes('running')) ok(); }); setTimeout(ok, 5000); });
+    const cfg = await (await fetch('http://127.0.0.1:' + P2 + '/api/config')).json();
+    const off = (await fetch('http://127.0.0.1:' + P2 + '/auth/google', { redirect: 'manual' })).status;
+    plain.kill(); fs.rmSync(D2, { recursive: true, force: true });
+    check('without Google settings the feature is off and its pages do not exist', cfg.google === false && off === 404);
+
     group = 'Sessions';
     r = await A2.post('/api/password', { current: 'wrong', next: 'new password 99' });
     check('password change needs the current password', r.status === 400);
@@ -378,6 +517,7 @@ async function main() {
     check('its stored files are removed from disk', await new Promise((ok) => setTimeout(() => ok(fs.readdirSync(path.join(DATA, 'uploads')).length === before - 1), 200)));
   } finally {
     server.kill();
+    google.close();
     fs.rmSync(DATA, { recursive: true, force: true });
   }
   if (serverErr.trim()) console.log('\nServer error output:\n' + serverErr);
