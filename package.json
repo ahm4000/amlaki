@@ -1,0 +1,12 @@
+{
+  "name": "amlaki",
+  "version": "1.0.0",
+  "description": "Multi-user property management website for owners and real estate agents",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/api.test.js"
+  },
+  "engines": { "node": ">=22.13" }
+}
